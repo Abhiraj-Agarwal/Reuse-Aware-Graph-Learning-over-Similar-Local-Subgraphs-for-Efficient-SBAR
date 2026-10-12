@@ -1,0 +1,17 @@
+# Python 3.8 - 3.12 (tested: Python 3.12, torch 2.10, numpy 2.0)
+#
+# Install PyTorch FIRST, matching your CUDA version (see https://pytorch.org/get-started/locally/), e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# then:
+#   pip install -r requirements.txt
+torch>=2.0
+numpy>=1.21
+PyYAML>=5.1
+tqdm
+tensorboardX
+networkx          # imported by graph/kinetics.py, which graph/__init__.py always imports
+
+# optional
+tensorboard       # view training curves: tensorboard --logdir runs
+thop              # FLOPs counting in the __main__ blocks of model/*.py
+matplotlib        # skeleton visualisation in feeders/feeder.py and graph/ntu_rgb_d.py

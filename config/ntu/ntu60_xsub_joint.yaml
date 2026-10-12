@@ -1,0 +1,61 @@
+# NTU RGB+D 60, cross-subject, joint stream.
+# Same model / optimiser settings as train_joint_amstgcn_ntu.yaml (the repo's original config);
+# only the data split and output dirs differ. The original was tuned for 4 GPUs x batch 8
+# (effective batch 32); here batch_size is per process, so on 1 GPU use 32 to keep the same
+# effective batch, or keep 8 when launching 4 processes with torchrun.
+work_dir: work_dir/ntu60/xsub/mstgcn_joint
+model_saved_name: runs/ntu60/xsub/mstgcn_joint
+# feeder
+feeder: feeders.feeder.Feeder
+train_feeder_args:
+  data_path: data/ntu/xsub/train_data_joint.npy
+  label_path: data/ntu/xsub/train_label.pkl
+  debug: False
+  random_choose: False
+  random_shift: False
+  random_move: False
+  window_size: -1
+  normalization: False
+
+test_feeder_args:
+  data_path: data/ntu/xsub/val_data_joint.npy
+  label_path: data/ntu/xsub/val_label.pkl
+  debug: False
+
+# model
+model: model.ST_GCN.Model
+model_args:
+  num_class: 60
+  num_point: 25
+  num_person: 2
+  block_args: [[3, 112, False, 1],
+               [112, 112, True, 1], [112, 112, True, 1], [112, 112, True, 1],
+               [112, 224, True, 2], [224, 224, True, 1], [224, 224, True, 1],
+               [224, 448, True, 2], [448, 448, True, 1], [448, 448, True, 1]]
+  graph: graph.ntu_rgb_d.Graph
+  graph_args:
+    labeling_mode: 'spatial'
+  kernel_size: 9
+  block_type: 'ms'
+  reduct_ratio: 2
+  expand_ratio: 0
+  s_scale: 4
+  t_scale: 4
+  layer_type: 'basic'
+  act: 'relu'
+  atten: 'None'
+  bias: True
+
+#optim
+weight_decay: 0.0001
+base_lr: 0.15
+step: [50, 70, 90]
+warm_up_epoch: 10
+
+# training
+device: [0]
+batch_size: 32
+test_batch_size: 64
+num_epoch: 110
+nesterov: True
+num_worker: 8
