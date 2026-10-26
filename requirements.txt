@@ -4,7 +4,7 @@
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 # then:
 #   pip install -r requirements.txt
-torch>=2.0
+torch>=2.3          # torch.amp.GradScaler("cuda")
 numpy>=1.21
 PyYAML>=5.1
 tqdm

@@ -36,7 +36,7 @@ This should print 2 training epochs, write a checkpoint to `runs/smoke_test/`, a
 2. Download the list of samples with missing skeletons from the official NTU repo
    (`NTU_RGBD_samples_with_missing_skeletons.txt` in https://github.com/shahroudy/NTURGB-D/tree/master/Matlab)
    and save it as `data/nturgbd_raw/samples_with_missing_skeletons.txt`.
-3. Generate the joint data (both xsub and xview; slow — the normalisation is pure-Python loops, expect hours):
+3. Generate the joint data (both xsub and xview, ~30 min; `--benchmark xsub` for one):
 
    ```bash
    cd data_gen
@@ -45,7 +45,7 @@ This should print 2 training epochs, write a checkpoint to `runs/smoke_test/`, a
    ```
 
    Output: `data/ntu/{xsub,xview}/{train,val}_data_joint.npy` with shape `(N, 3, 300, 25, 2)` and
-   `{train,val}_label.pkl`. It needs ~20 GB of disk, and the whole train split (~7 GB for xsub) is held in RAM.
+   `{train,val}_label.pkl`. It needs ~20 GB of disk; the arrays are written in place on disk, not held in RAM.
 
 Optional bone stream: `python data_gen/gen_bone_data.py` from the repo root (edit the `datasets` set at the top
 first; it only lists `ntu/xview`). `gen_motion_data.py` / `merge_*.py` have hard-coded `/data/ChenZhan/...`
@@ -73,8 +73,22 @@ python main.py --config config/ntu/ntu60_xsub_joint.yaml --phase test --weights 
 
 Notes on the original training loop (unchanged):
 - Evaluation only runs after epoch `step[0]` (50); checkpoints are saved every epoch after epoch 50.
-- If `model_saved_name` already exists, `main.py` asks `delete it? y/n` on stdin.
+- If `model_saved_name` already exists, `main.py` asks `delete it? y/n` on stdin (only in an interactive
+  terminal and without `--resume True`).
 - Logs: `work_dir/.../log.txt`; TensorBoard: `tensorboard --logdir runs`.
+
+Added for long runs on a shared machine (see [WORKSTATION.md](WORKSTATION.md) for the Windows workstation steps):
+- `--resume True` continues from `<work_dir>/checkpoint.pt` (falling back to `checkpoint.pt.prev`), which is
+  rewritten after every epoch together with the per-epoch history; a finished run writes `<work_dir>/DONE`.
+- `tools/export_run.py`: after training, writes `results/<config name>/` with `report.md` (config, results,
+  block-by-block analysis, history, what every file means), per-clip embeddings after every block, weights, CSVs.
+- `amp` (mixed precision, off by default) and `grad_accum` (optimizer step every N batches) in the config; the
+  NTU-60 configs use batch 8 x 4 = the original effective batch 32, in fp32.
+- `resource_limits` in the config caps CPU, GPU memory, GPU busy time and optionally RAM (`resource_limits.py`).
+- `scripts/*.ps1` (Windows): `setup_env` installs Python / PyTorch with CUDA / requirements, `prepare_ntu` builds
+  the NTU data from the zip, `run_training` does a complete run (train + export, resumable) with live progress,
+  `show_usage` shows what it uses; `register_training_task` / `stop_training` for running it via Task Scheduler.
+- Progress lines (run % done, time left, finish time) every 10 minutes in the log and `<work_dir>/progress.txt`.
 
 ## Changes made to get it running (no model / training logic changed)
 
@@ -91,3 +105,8 @@ Notes on the original training loop (unchanged):
   - `test_feeder_args['debug']` -> `.get('debug', False)` so test mode works with the provided configs.
 - New: `requirements.txt`, `config/ntu/ntu60_{xsub,xview}_joint.yaml`, `config/smoke_test.yaml`,
   `tools/make_dummy_data.py`, this file.
+- `feeders/feeder.py`: DataLoader workers on Windows re-open the memory-mapped data instead of receiving a pickled
+  copy of the whole array.
+- `data_gen/preprocess.py`: the rotation steps are vectorised (same output bit for bit, ~15x faster overall);
+  `data_gen/ntu_gendata.py` writes through a memory map and takes `--benchmark`.
+- `main.py`: the learning rate is a plain float (a numpy float in the optimizer state blocked loading checkpoints).

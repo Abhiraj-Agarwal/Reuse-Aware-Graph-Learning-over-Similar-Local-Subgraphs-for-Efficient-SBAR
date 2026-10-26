@@ -59,6 +59,21 @@ class Feeder(Dataset):
             self.data = self.data[0:100]
             self.sample_name = self.sample_name[0:100]
 
+    def __getstate__(self):
+        # DataLoader workers on Windows (spawn) receive a pickled copy of the dataset; numpy would pickle the
+        # whole memory-mapped array, so send the path instead and re-open the file in the worker
+        state = self.__dict__.copy()
+        if self.use_mmap:
+            del state['data']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if 'data' not in state:
+            self.data = np.load(self.data_path, mmap_mode='r')
+            if self.debug:
+                self.data = self.data[0:100]
+
     def get_mean_map(self):
         data = self.data
         N, C, T, V, M = data.shape

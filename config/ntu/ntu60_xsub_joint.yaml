@@ -1,8 +1,9 @@
 # NTU RGB+D 60, cross-subject, joint stream.
 # Same model / optimiser settings as train_joint_amstgcn_ntu.yaml (the repo's original config);
 # only the data split and output dirs differ. The original was tuned for 4 GPUs x batch 8
-# (effective batch 32); here batch_size is per process, so on 1 GPU use 32 to keep the same
-# effective batch, or keep 8 when launching 4 processes with torchrun.
+# (effective batch 32). Here one GPU does 8 clips per step and accumulates 4 steps per optimizer
+# update: the same averaged gradient over 32 clips, in fp32, within half the VRAM (batch 32 at
+# 300 frames needs ~27 GB). With torchrun on 4 GPUs use --grad-accum 1.
 work_dir: work_dir/ntu60/xsub/mstgcn_joint
 model_saved_name: runs/ntu60/xsub/mstgcn_joint
 # feeder
@@ -54,8 +55,17 @@ warm_up_epoch: 10
 
 # training
 device: [0]
-batch_size: 32
-test_batch_size: 64
+batch_size: 8      # per step = the original per-GPU batch; check it fits: tools/bench_train.py --gpu-mem-fraction 0.48
+grad_accum: 4      # batch_size x grad_accum = 32, the original effective batch (4 GPUs x 8)
+amp: False         # fp32 like the original code; True = mixed precision (faster, less memory, slightly different numbers)
+test_batch_size: 32
 num_epoch: 110
 nesterov: True
-num_worker: 8
+num_worker: 2      # plenty: a worker only copies 180 KB per clip from the memory-mapped file
+
+# share of the machine this run may use (see resource_limits.py); null = no limit
+resource_limits:
+  gpu_mem_fraction: 0.48  # of 24 GB, +~0.5 GB CUDA context -> ~50% of VRAM (12 GB) in nvidia-smi
+  ram_gb: 16              # ~50% of 32 GB, hard cap for training + its workers (it needs ~5-8 GB)
+  cpu_percent: null       # CPU time is not limited
+  gpu_duty: null          # GPU time is not limited (1.0 = flat out)

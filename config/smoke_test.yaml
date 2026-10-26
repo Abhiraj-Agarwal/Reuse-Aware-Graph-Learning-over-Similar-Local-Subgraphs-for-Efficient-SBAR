@@ -49,10 +49,18 @@ base_lr: 0.15
 step: [1]
 warm_up_epoch: 0
 
-# training
+# training (same mechanics as the real configs: accumulation, workers, resource limits)
 device: [0]
 batch_size: 4
+grad_accum: 2
+amp: False
 test_batch_size: 8
 num_epoch: 2
 nesterov: True
-num_worker: 0
+num_worker: 2
+
+resource_limits:
+  gpu_mem_fraction: 0.48
+  ram_gb: 16
+  cpu_percent: null
+  gpu_duty: null

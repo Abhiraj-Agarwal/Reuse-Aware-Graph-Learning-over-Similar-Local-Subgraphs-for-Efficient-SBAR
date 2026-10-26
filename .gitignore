@@ -5,3 +5,6 @@
 /work_dir
 
 /runs
+
+/.venv
+/results

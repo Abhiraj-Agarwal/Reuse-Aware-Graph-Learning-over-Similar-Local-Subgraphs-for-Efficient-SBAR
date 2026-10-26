@@ -2,6 +2,7 @@ import argparse
 import pickle
 from tqdm import tqdm
 import sys
+from numpy.lib.format import open_memmap
 
 sys.path.extend(['../'])
 from data_gen.preprocess import pre_normalization
@@ -131,14 +132,16 @@ def gendata(data_path, out_path, ignored_sample_path=None, benchmark='xview', pa
     with open('{}/{}_label.pkl'.format(out_path, part), 'wb') as f:
         pickle.dump((sample_name, list(sample_label)), f)
 
-    fp = np.zeros((len(sample_label), 3, max_frame, num_joint, max_body_true), dtype=np.float32)
+    # written in place on disk instead of held in RAM (the xsub train split alone is 7 GB)
+    fp = open_memmap('{}/{}_data_joint.npy'.format(out_path, part), dtype=np.float32, mode='w+',
+                     shape=(len(sample_label), 3, max_frame, num_joint, max_body_true))
 
     for i, s in enumerate(tqdm(sample_name)):
         data = read_xyz(os.path.join(data_path, s), max_body=max_body_kinect, num_joint=num_joint)
         fp[i, :, 0:data.shape[1], :, :] = data
 
-    fp = pre_normalization(fp)
-    np.save('{}/{}_data_joint.npy'.format(out_path, part), fp)
+    pre_normalization(fp)  # works in place
+    fp.flush()
 
 
 if __name__ == '__main__':
@@ -147,12 +150,12 @@ if __name__ == '__main__':
     parser.add_argument('--ignored_sample_path',
                         default='../data/nturgbd_raw/samples_with_missing_skeletons.txt')
     parser.add_argument('--out_folder', default='../data/ntu/')
+    parser.add_argument('--benchmark', nargs='+', default=['xsub', 'xview'], choices=['xsub', 'xview'])
 
-    benchmark = ['xsub', 'xview']
     part = ['train', 'val']
     arg = parser.parse_args()
 
-    for b in benchmark:
+    for b in arg.benchmark:
         for p in part:
             out_path = os.path.join(arg.out_folder, b)
             if not os.path.exists(out_path):

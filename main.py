@@ -2,6 +2,7 @@
 from __future__ import print_function
 import argparse
 import os
+import sys
 import time
 import numpy as np
 import yaml
@@ -21,6 +22,7 @@ import inspect
 import torch.backends.cudnn as cudnn
 
 import torch.distributed as dist
+import resource_limits
 #import thop
 # import torch.nn.parallel.DistributedDataParallel as DDP
 
@@ -169,7 +171,27 @@ def get_parser():
     parser.add_argument('--only_train_part', default=False)
     parser.add_argument('--only_train_epoch', default=0)
     parser.add_argument('--warm_up_epoch', type=int, default=0)
-    
+    parser.add_argument('--amp', type=str2bool, default=False, help='mixed precision (fp16 autocast) on CUDA')
+    parser.add_argument(
+        '--grad-accum',
+        type=int,
+        default=1,
+        help='optimizer step every N batches (effective batch = N x batch size)')
+    parser.add_argument(
+        '--resume',
+        type=str2bool,
+        default=False,
+        help='continue from <work_dir>/checkpoint.pt (written after every epoch) if it exists')
+    parser.add_argument(
+        '--resource-limits',
+        default=dict(),
+        help='share of the machine this run may use, see resource_limits.py')
+    parser.add_argument(
+        '--progress-interval',
+        type=float,
+        default=10,
+        help='minutes between progress lines (run %% done, time left) in the log and <work_dir>/progress.txt')
+
     parser.add_argument('--local_rank', '--local-rank', dest='local_rank', default=-1, type=int,
                     help='node rank for distributed training')
                     
@@ -187,7 +209,9 @@ class Processor():
             self.save_arg()
             if arg.phase == 'train':
                 if not arg.train_feeder_args['debug']:
-                    if os.path.isdir(arg.model_saved_name):
+                    # only ask when someone can answer: not when resuming or running in the background
+                    interactive = sys.stdin is not None and sys.stdin.isatty()
+                    if os.path.isdir(arg.model_saved_name) and interactive and not arg.resume:
                         print('log_dir: ', arg.model_saved_name, 'already exist')
                         answer = input('delete it? y/n:')
                         if answer == 'y':
@@ -202,10 +226,28 @@ class Processor():
                     self.train_writer = self.val_writer = SummaryWriter(os.path.join(arg.model_saved_name, 'test'), 'test')
         self.global_step = 0
         self.load_model()
+        for line in resource_limits.apply(self.arg.resource_limits, self.output_device):
+            self.print_log('Resource limits: ' + line)
+        resource_limits.keep_awake()
+        self.throttle = resource_limits.GpuThrottle((self.arg.resource_limits or {}).get('gpu_duty'),
+                                                    self.output_device)
         self.load_optimizer()
         self.load_data()
         self.lr = self.arg.base_lr
         self.best_acc = [0, 0] # [epoch, acc]
+        self.history = []  # one dict per finished epoch; kept in checkpoint.pt, read by tools/export_run.py
+        self.resumes = 0
+        # for the progress lines: training speed measured in this session, the first line after 2 minutes
+        self.session_start = time.time()
+        self.session_batches = 0
+        self.session_train_seconds = 0.0
+        self.eval_seconds = None
+        self.next_progress = time.time() + 120
+        self.checkpoint_path = os.path.join(self.arg.work_dir, 'checkpoint.pt')
+        self.resumed_step = None
+        if self.arg.phase == 'train' and self.arg.resume and (
+                os.path.exists(self.checkpoint_path) or os.path.exists(self.checkpoint_path + '.prev')):
+            self.load_checkpoint()
 
     def load_data(self):
         Feeder = import_class(self.arg.feeder)
@@ -220,6 +262,7 @@ class Processor():
                 pin_memory=True,
                 sampler=self.train_sampler,
                 num_workers=self.arg.num_worker,
+                persistent_workers=self.arg.num_worker > 0,  # Windows re-spawns workers every epoch otherwise
                 drop_last=True,
                 worker_init_fn=init_seed)
         self.test_data = Feeder(**self.arg.test_feeder_args)
@@ -240,7 +283,9 @@ class Processor():
 
         output_device = torch.device(f'cuda:{arg.local_rank}') if torch.cuda.is_available() else torch.device('cpu')
         self.output_device = output_device
-        
+        self.print_log('Device: {}'.format(
+            torch.cuda.get_device_name(output_device) if output_device.type == 'cuda' else 'cpu (no CUDA GPU found)'))
+
         Model = import_class(self.arg.model)
         if arg.local_rank == 0:
             shutil.copy2(inspect.getfile(Model), self.arg.work_dir)
@@ -316,6 +361,9 @@ class Processor():
         else:
             raise ValueError()
 
+        self.use_amp = self.arg.amp and self.output_device.type == 'cuda'
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+
         self.lr_scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1,
                                               patience=10,
                                               threshold=1e-4, threshold_mode='rel',
@@ -330,13 +378,96 @@ class Processor():
             with open('{}/config.yaml'.format(self.arg.work_dir), 'w') as f:
                 yaml.dump(arg_dict, f)
 
+    def save_checkpoint(self, epoch):
+        # everything needed to continue after `epoch`. Written to a temp file and forced to disk before it
+        # replaces the old one, and the previous checkpoint is kept as checkpoint.pt.prev, so a power cut at
+        # any moment leaves at least one complete checkpoint
+        if arg.local_rank == 0:
+            state = {'model': {k.split('module.')[-1]: v.cpu() for k, v in self.model.state_dict().items()},
+                     'optimizer': self.optimizer.state_dict(),
+                     'scaler': self.scaler.state_dict(),
+                     'epoch': epoch,
+                     'global_step': int(self.global_step),
+                     'best_acc': self.best_acc,
+                     'history': self.history,
+                     'resumes': self.resumes}
+            tmp = self.checkpoint_path + '.tmp'
+            with open(tmp, 'wb') as f:
+                torch.save(state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(self.checkpoint_path):
+                os.replace(self.checkpoint_path, self.checkpoint_path + '.prev')
+            os.replace(tmp, self.checkpoint_path)
+
+    def load_checkpoint(self):
+        for path in (self.checkpoint_path, self.checkpoint_path + '.prev'):
+            if not os.path.exists(path):
+                continue
+            try:
+                state = torch.load(path, map_location=self.output_device)
+                break
+            except Exception as e:  # truncated by a power cut: fall back to the previous one
+                self.print_log('Could not read {} ({}), trying the previous checkpoint.'.format(path, e))
+        else:
+            raise RuntimeError('--resume: no readable checkpoint in {}'.format(self.arg.work_dir))
+        getattr(self.model, 'module', self.model).load_state_dict(state['model'])
+        self.optimizer.load_state_dict(state['optimizer'])
+        self.scaler.load_state_dict(state['scaler'])
+        self.arg.start_epoch = state['epoch'] + 1
+        self.resumed_step = state['global_step']
+        self.best_acc = state['best_acc']
+        self.history = state.get('history', [])
+        self.resumes = state.get('resumes', 0) + 1
+        self.print_log('Resumed from {} after epoch {} (best acc so far {:.2f}% at epoch {}).'.format(
+            path, state['epoch'] + 1, self.best_acc[1] * 100, self.best_acc[0]))
+
+    def log_progress(self, epoch, batches_done, batches, epoch_elapsed=0.0):
+        # one line in the log + <work_dir>/progress.txt, so a look hours later shows how far the run is and
+        # roughly when it ends (from the speed measured in this session)
+        self.next_progress = time.time() + self.arg.progress_interval * 60
+        if arg.local_rank != 0 or not self.session_batches:
+            return
+        per_batch = (self.session_train_seconds + epoch_elapsed) / self.session_batches
+        epochs = self.arg.num_epoch
+        finished = batches_done == batches  # called after the epoch's evaluation
+        batches_left = (epochs - epoch - 1) * batches + (batches - batches_done)
+        evals_left = sum(1 for e in range(epoch + finished, epochs) if e + 1 > self.arg.step[0])
+        eval_seconds = self.eval_seconds if self.eval_seconds is not None else \
+            per_batch * batches * len(self.test_data) / len(self.train_data) / 3  # forward only, ~1/3 of a step
+        left = batches_left * per_batch + evals_left * eval_seconds
+        done = (epoch + batches_done / batches) / epochs
+        eta = time.strftime('%a %d %b %H:%M', time.localtime(time.time() + left))
+        self.print_log('Progress: epoch {}/{}, batch {}/{} | run {:.1f}% done | {:.2f} s/batch | '
+                       'left ~{} (finishes ~{}) | running {} this session'.format(
+                           epoch + 1, epochs, batches_done, batches, 100 * done, per_batch, fmt_duration(left),
+                           eta, fmt_duration(time.time() - self.session_start)))
+        last = self.history[-1] if self.history else {}
+        with open(os.path.join(self.arg.work_dir, 'progress.txt'), 'w') as f:
+            f.write('updated          : {}  (if this is old, training is not running)\n'.format(
+                time.strftime('%Y-%m-%d %H:%M:%S')))
+            f.write('config           : {}\n'.format(self.arg.config))
+            f.write('epoch            : {} of {} ({})\n'.format(
+                epoch + 1, epochs, 'finished' if finished else 'batch {} of {}'.format(batches_done, batches)))
+            f.write('run done         : {:.1f}%\n'.format(100 * done))
+            f.write('time left        : ~{} (finishes ~{})\n'.format(fmt_duration(left), eta))
+            f.write('speed            : {:.2f} s per batch of {} clips\n'.format(per_batch, self.arg.batch_size))
+            f.write('last epoch       : {}\n'.format('epoch {}: train loss {:.4f}, train acc {:.2f}%{}'.format(
+                last['epoch'], last['train_loss'], 100 * last['train_acc'],
+                '' if last.get('val_acc') is None else ', val acc {:.2f}%'.format(100 * last['val_acc']))
+                if last else '-'))
+            f.write('best val acc     : {:.2f}% (epoch {})\n'.format(100 * self.best_acc[1], self.best_acc[0]))
+            f.write('interruptions    : {}\n'.format(self.resumes))
+            f.write('full log         : {}\n'.format(os.path.join(self.arg.work_dir, 'log.txt')))
+
     def adjust_learning_rate(self, epoch):
         if self.arg.optimizer == 'SGD' or self.arg.optimizer == 'Adam':
             if epoch < self.arg.warm_up_epoch:
                 lr = self.arg.base_lr * (epoch + 1) / self.arg.warm_up_epoch
             else:
+                # plain float, not numpy: it ends up in the optimizer state in checkpoint.pt
                 lr = self.arg.base_lr * (
-                        0.1 ** np.sum(epoch >= np.array(self.arg.step)))
+                        0.1 ** int(np.sum(epoch >= np.array(self.arg.step))))
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
             return lr
@@ -379,11 +510,14 @@ class Processor():
         # for name, param in self.model.named_parameters():
         #     self.train_writer.add_histogram(name, param.clone().cpu().data.numpy(), epoch)
         loss_value = []
+        acc_value = []
+        epoch_start = time.time()
         if arg.local_rank == 0:
             self.train_writer.add_scalar('epoch', epoch, self.global_step)
         self.record_time()
-        timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
+        timer = dict(dataloader=0.001, model=0.001, statistics=0.001, throttle=0.001)
         process = tqdm(loader)
+        self.optimizer.zero_grad()
         if self.arg.only_train_part:
             if epoch > self.arg.only_train_epoch:
                 print('only train part, require grad')
@@ -406,26 +540,31 @@ class Processor():
                 timer['dataloader'] += self.split_time()
 
             # forward
-            features, output = self.model(data)
-            # if batch_idx == 0 and epoch == 0:
-            #     self.train_writer.add_graph(self.model, output)
-            if isinstance(output, tuple):
-                output, l1 = output
-                l1 = l1.mean()
-            else:
-                l1 = 0
-            loss = self.loss(output, label) + l1
+            self.throttle.start()
+            with torch.autocast(self.output_device.type, enabled=self.use_amp):
+                features, output = self.model(data)
+                # if batch_idx == 0 and epoch == 0:
+                #     self.train_writer.add_graph(self.model, output)
+                if isinstance(output, tuple):
+                    output, l1 = output
+                    l1 = l1.mean()
+                else:
+                    l1 = 0
+                loss = self.loss(output, label) + l1
 
             # backward
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss / self.arg.grad_accum).backward()
+            if (batch_idx + 1) % self.arg.grad_accum == 0:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
             loss_value.append(loss.item())
             if arg.local_rank == 0:
                 timer['model'] += self.split_time()
 
             value, predict_label = torch.max(output.data, 1)
             acc = torch.mean((predict_label == label.data).float())
+            acc_value.append(acc.item())
             if arg.local_rank == 0:
                 self.train_writer.add_scalar('acc', acc, self.global_step)
                 self.train_writer.add_scalar('loss', loss.item(), self.global_step)
@@ -442,6 +581,13 @@ class Processor():
             #             batch_idx, len(loader), loss.data[0], lr))
             if arg.local_rank == 0:
                 timer['statistics'] += self.split_time()
+            self.throttle.stop()
+            if arg.local_rank == 0:
+                timer['throttle'] += self.split_time()
+            self.session_batches += 1
+            if time.time() >= self.next_progress:
+                self.log_progress(epoch, batch_idx + 1, len(loader), time.time() - epoch_start)
+        self.session_train_seconds += time.time() - epoch_start
 
         # statistics of time consumption and loss
         if arg.local_rank == 0:
@@ -451,10 +597,16 @@ class Processor():
             }
         self.print_log(
             '\tMean training loss: {:.4f}.'.format(np.mean(loss_value)))
+        self.history.append(dict(epoch=epoch + 1, lr=self.optimizer.param_groups[0]['lr'],
+                                 train_loss=float(np.mean(loss_value)), train_acc=float(np.mean(acc_value)),
+                                 val_acc=None, train_minutes=round((time.time() - epoch_start) / 60, 2),
+                                 finished=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                 **resource_limits.peak_usage(self.output_device)))
         if arg.local_rank == 0:
             self.print_log(
-                '\tTime consumption: [Data]{dataloader}, [Network]{model}'.format(
+                '\tTime consumption: [Data]{dataloader}, [Network]{model}, [Throttle sleep]{throttle}'.format(
                     **proportion))
+            self.print_log('\tResource usage: {}'.format(resource_limits.usage(self.output_device)))
             if save_model:
                 if arg.local_rank == 0:
                     state_dict = self.model.state_dict()
@@ -482,7 +634,10 @@ class Processor():
                 for batch_idx, (data, label, index) in enumerate(process):
                     data = data.float().to(self.output_device)
                     label = label.long().to(self.output_device)
-                    _, output = self.model(data)
+                    self.throttle.start()
+                    with torch.autocast(self.output_device.type, enabled=self.use_amp):
+                        _, output = self.model(data)
+                    self.throttle.stop()
                     # if isinstance(output, tuple):
                     #     output, l1 = output
                     #     l1 = l1.mean()
@@ -523,6 +678,8 @@ class Processor():
                 total_num = int(total_num)
 
                 accuracy = int(right_num_total) / total_num
+                if self.arg.phase == 'train' and self.history:
+                    self.history[-1]['val_acc'] = accuracy
 
                 if accuracy > self.best_acc[1]:
                     self.best_acc[0] = epoch + 1
@@ -554,6 +711,8 @@ class Processor():
         if self.arg.phase == 'train':
             self.print_log('Parameters:\n{}\n'.format(str(vars(self.arg))))
             self.global_step = self.arg.start_epoch * len(self.data_loader['train']) / self.arg.batch_size
+            if self.resumed_step is not None:
+                self.global_step = self.resumed_step
             for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
 #                if self.lr < 1e-3:
 #                    break
@@ -562,13 +721,21 @@ class Processor():
 
                 self.train(epoch, save_model=save_model)
                 if (epoch + 1) > self.arg.step[0]:
+                    eval_start = time.time()
                     self.eval(
                         epoch,
                         save_score=self.arg.save_score,
                         loader_name=['test'])
+                    self.eval_seconds = time.time() - eval_start
+                self.save_checkpoint(epoch)
+                n = len(self.data_loader['train'])
+                self.log_progress(epoch, n, n)
 
             self.print_log('epoch: {}, best accuracy: {}'.format(self.best_acc[0], self.best_acc[1]))
             self.print_log('Experiment: {}'.format(self.arg.work_dir))
+            if arg.local_rank == 0:
+                # tells scripts/run_training.ps1 not to start this run again
+                open(os.path.join(self.arg.work_dir, 'DONE'), 'w').close()
 
         elif self.arg.phase == 'test':
             if not self.arg.test_feeder_args.get('debug', False):
@@ -589,6 +756,15 @@ def make_sampler(dataset):
     if dist.is_initialized():
         return torch.utils.data.distributed.DistributedSampler(dataset)
     return torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=1, rank=0)
+
+
+def fmt_duration(seconds):
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return '{}d {}h {:02d}m'.format(days, hours, minutes)
+    return '{}h {:02d}m'.format(hours, minutes) if hours else '{}m'.format(minutes)
 
 
 def str2bool(v):
